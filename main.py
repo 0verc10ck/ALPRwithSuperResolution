@@ -6,6 +6,8 @@ from torch.autograd import Variable
 from torchvision import transforms
 from torchvision.utils import save_image
 from datasets import denormalize, mean, std
+from skimage.segmentation import clear_border
+from imutils import contours
 
 import math
 import random
@@ -18,18 +20,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import pytesseract
+import imutils
 
 netMain = None
 metaMain = None
-altNames = None
+altNames = None 
 
 
 def init():
     global list_img
-    list_img = np.array(os.listdir('./data/test'))
+    list_img = np.array(os.listdir('./data/testn'))
     os.makedirs("./data/preprocessed_img", exist_ok=True)
     os.makedirs("./data/sr_img", exist_ok=True)
 
+    
 #Yolo Detector
 def Detector():
     global metaMain, netMain, altNames
@@ -75,7 +79,7 @@ def Detector():
    
     for i in range(0, len(list_img)):  
         path = './data/testn/' + list_img[i]
-        detections = (darknet.performDetect(path, 0.25, configPath, weightPath, metaPath, False, False))
+        detections = (darknet.performDetect(path, 0.25, configPath, weightPath, metaPath, False, False))   
         SuperResolution(list_img[i], preprocess(path, detections))
 
      
@@ -116,18 +120,22 @@ def preprocess(path, detections):
     
     except ValueError:
         print("Cannot save file ", f_name, "\n")
-        pass
-    
+        pass    
     return img_t
 
 
-def PSNR(img1, img2):
-    mse = np.mean(( img1 - img2) ** 2)
-    print("mse : ", mse)
+def PSNR(oripath, path):
+    img1 =  cv2.imread(oripath)
+    img2 = cv2.imread(path)
+    img1 = cv2.resize(img1, dsize=(1400, 400),interpolation=cv2.INTER_AREA)
+    mse = np.mean((img1 - img2) ** 2)
+    #print("mse : ", mse)
     if mse == 0:
         return 100
     PIXEL_MAX = 255.0
-    return 20* math.log10(PIXEL_MAX / math.sqrt(mse))
+    psnr = 20* math.log10(PIXEL_MAX / math.sqrt(mse))
+    return mse, psnr
+
 
 def SuperResolution(f_name, ori):
     pth = "./generator.pth"
@@ -150,13 +158,109 @@ def SuperResolution(f_name, ori):
 
     with torch.no_grad():
         sr_image = denormalize(generator(image_tensor)).cpu()
-
+    
     # Save image
     path = os.path.join("./data/sr_img/",f_name)
+    oripath = os.path.join("./data/preprocessed_img/",f_name)
     save_image(sr_image, path)
-    #OCR(path)
+    mse, psnr = PSNR(oripath, path)
+    string  = OCR(path)
+
     
+def OCR(path):
+    img = cv2.imread(path)
+    height, width, channel = img.shape
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    structuringElement = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    imgTopHat = cv2.morphologyEx(img, cv2.MORPH_TOPHAT, structuringElement)
+    imgBlackHat = cv2.morphologyEx(img, cv2.MORPH_BLACKHAT, structuringElement)
+    imgGrayscalePlusTopHat = cv2.add(img, imgTopHat)
+    img = cv2.subtract(imgGrayscalePlusTopHat, imgBlackHat)
+    
+    img = cv2.GaussianBlur(img, ksize=(9, 9), sigmaX=0)
+    ori =img.copy()
+
+    img = cv2.adaptiveThreshold(
+        img, 
+        maxValue=255, 
+        adaptiveMethod=cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        thresholdType=cv2.THRESH_BINARY_INV, 
+        blockSize=255, 
+        C=10
+    )
+    
+    contours, _ = cv2.findContours(
+        img, 
+        mode=cv2.RETR_LIST, 
+        method=cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    temp_result = np.zeros((height, width, channel), dtype=np.uint8)
+    contours_dict = []
+    for contour in contours:
+        x,y,w,h = cv2.boundingRect(contour)
+        cv2.rectangle(temp_result, pt1=(x,y), pt2=(x+w, y+h), color=(255,255,255))
+    
+        contours_dict.append({
+            'contour': contour,
+            'x': x,
+            'y': y,
+            'w': w,
+            'h': h,
+            'cx': x+(w/2),
+            'cy': y+(h/2)
+        })
+    
+    MIN_AREA = 1000
+    MIN_WIDTH, MIN_HEIGHT = 50, 150
+    MAX_WIDTH = 500
+
+    possible_contours = []
+
+    cnt = 0
+    for d in contours_dict:
+        area = d['w'] * d['h']
+    
+        if area > MIN_AREA and d['w'] > MIN_WIDTH and d['h'] > MIN_HEIGHT and d['w'] < MAX_WIDTH :
+            d['idx'] = cnt
+            cnt += 1
+            possible_contours.append(d)
+        
+    temp_result = np.zeros((height, width, channel), dtype=np.uint8)
+    
+    xmax = 0
+    xmin = 1400
+    ymax = 0
+    ymin = 400
+    for d in possible_contours:
+        cv2.rectangle(temp_result, pt1=(d['x'], d['y']), pt2=(d['x']+d['w'], d['y']+d['h']), color=(255, 255, 255), thickness=2)
+        if xmin > d['x'] :
+            xmin = d['x']
+        if xmax < d['x']+d['w'] :
+            xmax = d['x']+d['w']
+        if ymin > d['y'] :
+            ymin = d['y']
+        if ymax < d['y']+d['h'] :
+            ymax = d['y']+d['h']
+            
+    if xmin > 20:
+        xmin -= 20
+    if ymin > 20:
+        ymin -= 20
+    if xmax < 1380:
+        xmax +=20
+    if ymax < 380:
+        ymax += 20
+    
+    img = ori[ymin:ymax, xmin:xmax].copy()
+    plt.imshow(img, cmap='gray')
+    plt.show()  
+    string = pytesseract.image_to_string(img, lang='kor', config='--oem 1 --psm 7')
+    return string
+
 
 if __name__ == "__main__":
     init()
     Detector()
+
